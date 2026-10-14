@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import Quickshell.Hyprland
 import Quickshell.Services.Mpris
 
 // Owns exactly two things: enough Hyprland window state to find-or-launch
@@ -32,9 +33,55 @@ Item {
     try { return decodeURIComponent(url.substring("file://".length)) }
     catch (e) { return "" }
   }
+  readonly property string fullscreenOpenHelper: (Quickshell.env("HOME") || "")
+    + "/.config/omarchy/plugins/io.github.leandro-3rne.window-switcher/unfullscreen-on-new-window.sh"
+  readonly property string fullscreenMoveHelper: (Quickshell.env("HOME") || "")
+    + "/.config/omarchy/plugins/io.github.leandro-3rne.window-switcher/unfullscreen-on-window-move.sh"
+
+  // The media service is kept loaded with the bar, so this listener remains
+  // active even while the Alt-Tab overlay itself is closed.
+  Connections {
+    target: Hyprland
+    enabled: root.manageIpc
+    function onRawEvent(event) {
+      var eventName = String(event && event.name || "")
+      if (eventName === "closewindow") {
+        var closed = []
+        try { closed = event.parse(1) } catch (e) { return }
+        var closedAddress = String(closed[0] || "")
+        if (/^[0-9a-fA-F]+$/.test(closedAddress)) closedAddress = "0x" + closedAddress
+        var isMediaWindow = closedAddress === root.windowAddress
+        for (var c = 0; !isMediaWindow && c < root.youtubeWindows.length; c++)
+          isMediaWindow = String(root.youtubeWindows[c].address || "") === closedAddress
+        if (isMediaWindow) root.requestState("sync")
+        return
+      }
+      if (eventName !== "openwindow" && eventName !== "movewindow" && eventName !== "movewindowv2") return
+      var fields = []
+      try {
+        fields = event.parse(eventName === "openwindow" ? 4 : eventName === "movewindowv2" ? 3 : 2)
+      } catch (e) { return }
+      var address = String(fields[0] || "")
+      // Hyprland's event stream omits the 0x prefix used by clients JSON.
+      if (/^[0-9a-fA-F]+$/.test(address)) address = "0x" + address
+      if (!/^0x[0-9a-fA-F]+$/.test(address)) return
+      if (eventName === "openwindow")
+        Quickshell.execDetached(["bash", root.fullscreenOpenHelper, address])
+      else
+        Quickshell.execDetached(["bash", root.fullscreenMoveHelper, address])
+    }
+  }
 
   // ------------------------------------------------------- Hyprland window
   property int browserPid: 0
+  property string youtubeAddress: ""
+  property int youtubePid: 0
+  property var youtubePids: []
+  property var youtubeWindows: []
+  property bool youtubeVisible: false
+  property string lastPlayedSource: ""
+  property string lastYoutubeAddress: ""
+  property string lastPlayingPlayer: ""
   property string windowAddress: ""
   property string windowWorkspace: ""
   property bool windowWorkspaceVisible: false
@@ -85,6 +132,15 @@ Item {
     windowWorkspace = windowKnownOpen ? String(state.workspace || "") : ""
     windowWorkspaceVisible = windowKnownOpen && state.visible === true
     browserPid = windowKnownOpen ? (parseInt(state.pid, 10) || 0) : 0
+    youtubeAddress = String(state.youtubeAddress || "")
+    youtubePid = parseInt(state.youtubePid, 10) || 0
+    youtubePids = Array.isArray(state.youtubePids) ? state.youtubePids : []
+    youtubeWindows = Array.isArray(state.youtubeWindows) ? state.youtubeWindows : []
+    youtubeVisible = state.youtubeVisible === true
+    if (!lastPlayedSource && (state.lastPlayedSource === "apple" || state.lastPlayedSource === "youtube")) {
+      lastPlayedSource = state.lastPlayedSource
+      lastYoutubeAddress = String(state.lastYoutubeAddress || "")
+    }
 
     if (intent === "open") {
       // A window we already know about might be on the workspace the user
@@ -145,7 +201,6 @@ Item {
     if (launching || !controlPath) return
     // A newly created browser window must not inherit the presentation kept
     // for track-to-track gaps in the previous Apple Music session.
-    clearDisplayedMetadata()
     launching = true
     launchGroupTargetAddress = ""
     launchCommandStarted = false
@@ -165,12 +220,26 @@ Item {
   // Launches the real Chromium window if it doesn't exist yet; otherwise
   // toggles it between hidden and shown (see toggleVisibility). Used by the
   // bar icon's right-click and the popover's Open/Hide button.
-  function openWindow() { requestState("open") }
+  function openWindow() {
+    if (selectedSource === "youtube" && youtubeTargetAddress) {
+      Quickshell.execDetached(["bash", controlPath, "toggle-media", youtubeTargetAddress])
+      syncAfterWindowAction()
+      return
+    }
+    requestState("open")
+  }
 
   // Same launch-if-needed fallback, but never hides an already-open window
   // — always brings it into view. Used by the popover's tap-to-open
   // artwork/title, which should be a reliable "take me there", not a toggle.
   function focusWindow() { requestState("show") }
+
+  function focusPlayingWindow() {
+    if (selectedSource === "youtube" && youtubeTargetAddress) {
+      Quickshell.execDetached(["bash", controlPath, "show-media", youtubeTargetAddress])
+      syncAfterWindowAction()
+    } else focusWindow()
+  }
 
   // End the dedicated browser process instead of asking the page to close
   // its window. Apple Music installs a beforeunload handler while playback
@@ -186,7 +255,7 @@ Item {
     browserPid = 0
     launchGroupTargetAddress = ""
     launchCommandStarted = false
-    clearDisplayedMetadata()
+    if (activePlayer === applePlayer) clearDisplayedMetadata()
   }
 
   Process {
@@ -219,6 +288,13 @@ Item {
       root.requestState("sync")
       if (root.postActionSyncAttempts >= 6) stop()
     }
+  }
+
+  Timer {
+    interval: 2000
+    repeat: true
+    running: true
+    onTriggered: root.refresh()
   }
 
   // Read the focused window before launching. The active window changes to
@@ -261,6 +337,7 @@ Item {
 
   Component.onCompleted: Qt.callLater(function() {
     root.requestState("sync")
+    if (root.length > 0) root.lastStableLength = root.length
     initialPositionReveal.restart()
     // Covers a start that already has a track loaded, where artCandidate is
     // set from the outset and so never changes to announce itself.
@@ -316,33 +393,267 @@ Item {
     return null
   }
 
-  readonly property var activePlayer: playerForPid(browserPid)
+  readonly property var applePlayer: playerForPid(browserPid)
+  readonly property var youtubePlayer: playerForPid(youtubePid)
+  function parked(workspace) {
+    return workspace === "special:Music" || workspace === "special:Apple Music"
+      || workspace === "special:AM"
+  }
+  // A parked window always wins over a normal one. Within YouTube, the last
+  // window to emit audio wins; newly opened idle windows never steal its slot.
+  readonly property var youtubeTarget: {
+    var parkedWindow = null
+    var playedWindow = null
+    for (var i = 0; i < youtubeWindows.length; i++) {
+      var w = youtubeWindows[i]
+      if (w.address === lastYoutubeAddress) playedWindow = w
+      if (parked(w.workspace) && !parkedWindow) parkedWindow = w
+    }
+    if (playedWindow && parked(playedWindow.workspace)) return playedWindow
+    return parkedWindow || playedWindow || (youtubeWindows.length ? youtubeWindows[0] : null)
+  }
+  readonly property string youtubeTargetAddress: youtubeTarget ? String(youtubeTarget.address) : ""
+  readonly property bool youtubeTargetVisible: youtubeTarget ? youtubeTarget.visible === true : false
+  readonly property bool appleParked: windowKnownOpen && parked(windowWorkspace)
+  readonly property bool youtubeParked: youtubeTarget && parked(youtubeTarget.workspace)
+  readonly property var playingYoutubePlayer: {
+    var preferred = playerForPid(youtubeTarget ? youtubeTarget.pid : 0)
+    if (preferred && preferred.isPlaying) return preferred
+    for (var i = 0; i < players.length; i++)
+      if (players[i] && players[i].isPlaying && isYoutubePlayer(players[i])) return players[i]
+    return null
+  }
+  readonly property bool youtubePreferred: {
+    if (!youtubeTarget) return false
+    if (skipRequested && transitionSource) return transitionSource === "youtube"
+    return !windowKnownOpen || (youtubeParked && !appleParked) ||
+      (youtubeParked === appleParked &&
+        (playingYoutubePlayer && !(applePlayer && applePlayer.isPlaying)
+          || ((!!playingYoutubePlayer === !!(applePlayer && applePlayer.isPlaying))
+              && lastPlayedSource === "youtube")))
+  }
+
+  function recordPlayback(player) {
+    if (!player || !player.isPlaying) return
+    var name = String(player.dbusName || "")
+    if (player === applePlayer) {
+      lastPlayingPlayer = name
+      lastPlayedSource = "apple"
+      if (windowAddress)
+        Quickshell.execDetached(["bash", controlPath, "remember", "apple", windowAddress, lastYoutubeAddress])
+    } else if (isYoutubePlayer(player)) {
+      lastPlayingPlayer = name
+      var match = /\.instance(\d+)$/.exec(name)
+      var pid = match ? Number(match[1]) : 0
+      var address = ""
+      var track = String(player.trackTitle || "").trim().toLowerCase()
+      // Chromium can put several YouTube windows in the same process. Match
+      // the playing video's title against the window title before falling
+      // back to the most recently focused window of that process.
+      if (track.length > 4) {
+        for (var t = 0; t < youtubeWindows.length; t++) {
+          var candidate = youtubeWindows[t]
+          if (candidate.pid === pid && String(candidate.title || "").toLowerCase().indexOf(track) !== -1) {
+            address = String(candidate.address)
+            break
+          }
+        }
+      }
+      for (var i = 0; i < youtubeWindows.length; i++) {
+        if (!address && youtubeWindows[i].pid === pid) {
+          address = String(youtubeWindows[i].address)
+          break
+        }
+      }
+      lastYoutubeAddress = address || youtubeTargetAddress
+      lastPlayedSource = "youtube"
+      if (lastYoutubeAddress)
+        Quickshell.execDetached(["bash", controlPath, "remember", "youtube", lastYoutubeAddress])
+    }
+  }
+
+  Instantiator {
+    model: root.players
+    delegate: Item {
+      required property var modelData
+      visible: false
+      Connections {
+        target: modelData
+        function onIsPlayingChanged() {
+          if (modelData.isPlaying) root.recordPlayback(modelData)
+        }
+      }
+    }
+  }
+  function isYoutubePlayer(player) {
+    if (!player || !youtubeAddress) return false
+    if (player === youtubePlayer || /youtube/i.test(String(player.identity || ""))) return true
+    var match = /\.instance(\d+)$/.exec(String(player.dbusName || ""))
+    return !!match && youtubePids.indexOf(Number(match[1])) !== -1
+  }
+  // Playback wins; if both browsers play, the one that started playing most
+  // recently wins. Parked windows take priority over the audio history.
+  readonly property var activePlayer: {
+    var apple = applePlayer
+    var youtube = playerForPid(youtubeTarget ? youtubeTarget.pid : 0)
+    var playingYoutube = playingYoutubePlayer
+    if (skipRequested && transitionSource === "apple") return apple
+    if (skipRequested && transitionSource === "youtube") return youtube || playingYoutube
+    if (youtubeParked && !appleParked)
+      return youtube || playingYoutube
+    if (appleParked && !youtubeParked)
+      return apple
+    if (apple && apple.isPlaying && playingYoutube)
+      return youtubePreferred ? playingYoutube : apple
+    if (apple && apple.isPlaying) return apple
+    if (playingYoutube) return playingYoutube
+    for (var j = 0; j < players.length; j++)
+      if (players[j] && players[j].isPlaying) return players[j]
+    if (youtubePreferred) {
+      if (youtube) return youtube
+      for (var k = 0; k < players.length; k++)
+        if (isYoutubePlayer(players[k])) return players[k]
+      return null
+    }
+    if (windowKnownOpen) return apple
+    if (youtubeTarget) {
+      if (youtube) return youtube
+      for (var n = 0; n < players.length; n++)
+        if (isYoutubePlayer(players[n])) return players[n]
+    }
+    if (youtubeTarget) return null
+    return apple || (players.length > 0 ? players[0] : null)
+  }
+  readonly property string selectedSource: youtubePreferred ? "youtube" : "apple"
+  readonly property bool selectedWindowVisible: selectedSource === "youtube"
+    ? youtubeTargetVisible : windowVisible
   readonly property string rawTitle: activePlayer ? String(activePlayer.trackTitle || "") : ""
   readonly property string rawArtist: activePlayer ? String(activePlayer.trackArtist || "") : ""
   readonly property string rawAlbum: activePlayer ? String(activePlayer.trackAlbum || "") : ""
   readonly property string positionIdentity: (activePlayer ? String(activePlayer.dbusName || "") : "")
     + "\n" + rawTitle + "\n" + rawArtist
   property bool positionReady: false
+  property double lastObservedPosition: -1
+  property double lastStablePosition: 0
+  property bool positionEndJump: false
+  property double positionIdentityTimestamp: 0
+  property double positionAtIdentity: 0
+  property bool positionAtIdentityValid: false
+  property double lastStableLength: 0
 
-  onPositionIdentityChanged: {
-    clearPendingSeek()
+  function waitForStablePosition() {
     positionReady = false
     initialPositionReveal.restart()
   }
 
-  // A newly published Chromium media session commonly exposes duration and
-  // a temporary zero position in separate updates. Keep the slider hidden
-  // through that short initialization window so PanelSlider's 140ms fill
-  // animation cannot reveal a 0 -> current-position jump.
-  Timer {
-    id: initialPositionReveal
-    interval: 600
-    repeat: false
-    onTriggered: root.positionReady = !!root.activePlayer
+  function positionIsPlausible(value) {
+    var seconds = Number(value)
+    if (!isFinite(seconds) || seconds < 0 || seconds >= 86400) return false
+    if (positionEndJump && activePlayer && activePlayer.isPlaying) return false
+    // Do not clamp a broken MPRIS position to the track length: that turns a
+    // transient sentinel/overshoot into a misleading 100% progress reading.
+    return length <= 0 || seconds <= length + 5
   }
 
-  function restartInitialPositionReveal() {
-    initialPositionReveal.restart()
+  function observePositionChange() {
+    var reported = activePlayer ? Number(activePlayer.position) : NaN
+    if (activePlayer && !activePlayer.isPlaying && pendingSeekPosition < 0) {
+      // The paused/stopped MPRIS position may briefly reset while Chromium
+      // tears down its session. Keep the last playback sample until resume or
+      // an explicit seek instead of following that transient value.
+      lastObservedPosition = reported
+      return
+    }
+    if (!rawTitle && !rawArtist && !skipRequested
+        && (!activePlayer || !activePlayer.isPlaying)) return
+    var previous = lastObservedPosition
+    lastObservedPosition = reported
+
+    var nearEnd = length > 0 && reported >= length - 5
+    if (positionEndJump && (!activePlayer || !activePlayer.isPlaying || !nearEnd)) {
+      positionEndJump = false
+      waitForStablePosition()
+    }
+    // A jump from the opening part of a playing track straight to its end is
+    // not a credible playback update. Keep it quarantined until MPRIS reports
+    // a new track/position, an explicit seek is made, or playback is paused.
+    if (positionReady && pendingSeekPosition < 0 && activePlayer && activePlayer.isPlaying && length > 0
+        && previous >= 0 && previous < length * 0.25
+        && nearEnd && reported - previous > Math.max(5, length * 0.25)) {
+      positionEndJump = true
+      waitForStablePosition()
+      return
+    }
+    if (!positionIsPlausible(reported)) {
+      waitForStablePosition()
+      return
+    }
+    if (length > 0) lastStableLength = length
+    if (!positionReady) {
+      if (pendingSeekPosition < 0) lastStablePosition = reported
+      initialPositionReveal.restart()
+      return
+    }
+
+    // A normal playback update advances by about a second. Larger jumps that
+    // are not our own pending seek usually mean MPRIS has just reset or caught
+    // up to the newly loaded track; debounce the display until it settles.
+    if (pendingSeekPosition < 0 && activePlayer && activePlayer.isPlaying
+        && previous >= 0 && Math.abs(reported - previous) > 5) {
+      waitForStablePosition()
+      return
+    }
+    if (pendingSeekPosition < 0) lastStablePosition = reported
+  }
+
+  onPositionIdentityChanged: {
+    clearPendingSeek()
+    if (skipRequested) {
+      positionEndJump = false
+      waitForStablePosition()
+      return
+    }
+    if (activePlayer && !activePlayer.isPlaying
+        && rawTitle === displayedTitle && rawArtist === displayedArtist) {
+      positionEndJump = false
+      if (positionIsPlausible(lastStablePosition)) {
+        positionReady = true
+        initialPositionReveal.stop()
+      }
+      return
+    }
+    if (!rawTitle && !rawArtist && !skipRequested && (!activePlayer || !activePlayer.isPlaying))
+      return
+    var wasPositionReady = positionReady
+    var previousStablePosition = lastStablePosition
+    positionEndJump = false
+    lastStableLength = 0
+    positionIdentityTimestamp = Date.now()
+    var initialPosition = activePlayer ? Number(activePlayer.position) : NaN
+    if ((wasPositionReady || skipRequested) && length > 0 && isFinite(initialPosition)
+        && previousStablePosition >= 0
+        && initialPosition >= length - Math.max(5, length * 0.02)
+        && previousStablePosition < length * 0.25
+        && initialPosition - previousStablePosition > Math.max(5, length * 0.25))
+      initialPosition = previousStablePosition
+    positionAtIdentityValid = isFinite(initialPosition) && initialPosition >= 0 && initialPosition < 86400
+    positionAtIdentity = positionAtIdentityValid ? initialPosition : 0
+    lastStablePosition = positionAtIdentityValid ? initialPosition : 0
+    waitForStablePosition()
+  }
+
+  // Chromium can publish a temporary zero position and then correct either
+  // the position or duration in a later update. Debounce those changes so
+  // the slider does not reveal an intermediate range or 0 -> current jump.
+  Timer {
+    id: initialPositionReveal
+    interval: 450
+    repeat: false
+    onTriggered: {
+      root.positionReady = !!root.activePlayer
+        && !!(root.rawTitle || root.rawArtist)
+        && root.positionIsPlausible(root.activePlayer.position)
+    }
   }
 
   // Apple Music briefly clears its Media Session metadata between tracks.
@@ -353,8 +664,15 @@ Item {
   property string displayedTitle: ""
   property string displayedArtist: ""
   property string displayedAlbum: ""
+  property string displayedSource: ""
+  // Keeps the player panel mounted through MPRIS player/metadata handoffs.
+  // It is released only by the explicit idle/transition timeout path.
+  property bool mediaPresentationLatched: false
   property bool trackChanging: false
   property bool skipRequested: false
+  property string transitionSource: ""
+  property int seekCue: 0
+  property int seekCueSerial: 0
 
   function clearDisplayedMetadata() {
     displayedTitle = ""
@@ -362,14 +680,26 @@ Item {
     displayedAlbum = ""
     trackChanging = false
     skipRequested = false
+    transitionSource = ""
+    displayedSource = ""
+    mediaPresentationLatched = false
     artUrl = ""
     highResArtUrl = ""
     catalogLength = 0
+    lastStableLength = 0
   }
 
   function beginTrackTransition() {
+    transitionSource = selectedSource
     skipRequested = true
     trackChanging = true
+    positionEndJump = false
+    lastStablePosition = 0
+    lastStableLength = 0
+    positionIdentityTimestamp = Date.now()
+    positionAtIdentity = 0
+    positionAtIdentityValid = true
+    waitForStablePosition()
     metadataGapTimeout.stop()
     trackTransitionTimeout.restart()
     artUrl = ""
@@ -380,6 +710,18 @@ Item {
   function refreshDisplayedMetadata() {
     if (!rawTitle && !rawArtist) {
       if (displayedTitle || displayedArtist) {
+        // A pause/stop can momentarily clear MPRIS metadata without changing
+        // tracks. Keep the current presentation and position through that gap.
+        if (!skipRequested && (!activePlayer || !activePlayer.isPlaying)) {
+          trackChanging = false
+          positionEndJump = false
+          if (positionIsPlausible(lastStablePosition)) {
+            positionReady = true
+            initialPositionReveal.stop()
+          }
+          metadataGapTimeout.restart()
+          return
+        }
         trackChanging = true
         artUrl = ""
         highResArtUrl = ""
@@ -390,11 +732,20 @@ Item {
       }
       return
     }
+    var nextKey = rawTitle + "\n" + rawArtist
+    var previousKey = displayedTitle + "\n" + displayedArtist
+    if (skipRequested && nextKey === previousKey) return
+    if (skipRequested) {
+      positionEndJump = false
+      positionIdentityTimestamp = Date.now()
+      positionAtIdentity = 0
+      positionAtIdentityValid = true
+      lastStablePosition = 0
+    }
     metadataGapTimeout.stop()
     trackTransitionTimeout.stop()
     skipRequested = false
-    var nextKey = rawTitle + "\n" + rawArtist
-    var previousKey = displayedTitle + "\n" + displayedArtist
+    transitionSource = ""
     if (nextKey !== previousKey) {
       // Never let the temporary Chromium Media Session icon captured during
       // the metadata gap become the next song's cover.
@@ -404,8 +755,9 @@ Item {
     displayedTitle = rawTitle
     displayedArtist = rawArtist
     displayedAlbum = rawAlbum
+    mediaPresentationLatched = true
     trackChanging = false
-    localArtDelay.restart()
+    queueSnapshotArt()
   }
 
   // Metadata normally returns quickly during a skip. If it stays empty, the
@@ -413,7 +765,7 @@ Item {
   // instead of showing the last artist and an endless loading message.
   Timer {
     id: metadataGapTimeout
-    interval: 1500
+    interval: root.skipRequested ? 30000 : 10000
     repeat: false
     onTriggered: if (!root.rawTitle && !root.rawArtist) root.clearDisplayedMetadata()
   }
@@ -423,7 +775,7 @@ Item {
   // a safety net for a browser/MPRIS instance that disappears mid-transition.
   Timer {
     id: trackTransitionTimeout
-    interval: 8000
+    interval: 30000
     repeat: false
     onTriggered: {
       if (root.skipRequested && !root.rawTitle && !root.rawArtist)
@@ -431,8 +783,8 @@ Item {
     }
   }
 
-  readonly property bool hasMedia: !!(rawTitle || rawArtist ||
-    (windowKnownOpen && (displayedTitle || displayedArtist)))
+  readonly property bool hasMedia: mediaPresentationLatched || !!(rawTitle || rawArtist ||
+    (activePlayer && (displayedTitle || displayedArtist)) || trackChanging || skipRequested)
   readonly property string title: rawTitle || rawArtist ? rawTitle : displayedTitle
   readonly property string artist: rawTitle || rawArtist ? rawArtist : displayedArtist
   readonly property string album: rawTitle || rawArtist ? rawAlbum : displayedAlbum
@@ -450,7 +802,7 @@ Item {
   property string highResArtUrl: ""
   property double catalogLength: 0
   property bool catalogLookupRunning: false
-  property bool catalogLookupEnabled: true
+  property bool catalogLookupEnabled: false
   property int catalogRetryAttempt: 0
   // Every track on an album normally shares one catalog artwork URL. Keep
   // successful resolutions for this shell session so one well-indexed track
@@ -790,26 +1142,57 @@ Item {
 
   // The artwork file named by the player, before anything has been read.
   readonly property string artCandidate: safeArtPath(activePlayer ? activePlayer.trackArtUrl : "")
+  // Non-Chromium players commonly publish HTTPS artwork rather than a temp
+  // file. The small record label can load it directly without a catalog query.
+  readonly property string directArtUrl: {
+    var url = activePlayer ? String(activePlayer.trackArtUrl || "") : ""
+    return /^https:\/\//i.test(url) ? url : ""
+  }
+  readonly property string coverUrl: directArtUrl || artUrl
 
   // What the popover actually loads: control.sh's own copy of the artwork,
   // never the name above. That name is one this plugin is handed rather than
   // one it picks, so it is used once to read from and never passed on to be
   // opened again. Empty until a copy succeeds, which shows the placeholder.
   property string artUrl: ""
+  property string lastSnapCandidate: ""
+  property string transitionalArtCandidate: ""
 
-  onArtCandidateChanged: queueSnapshotArt()
+  Timer {
+    id: transitionalArtTimeout
+    interval: 1800
+    onTriggered: {
+      root.transitionalArtCandidate = ""
+      root.queueSnapshotArt()
+    }
+  }
+
+  onArtCandidateChanged: {
+    if (!rawTitle && !rawArtist && artCandidate) {
+      transitionalArtCandidate = artCandidate
+      transitionalArtTimeout.restart()
+    } else if (artCandidate && artCandidate !== transitionalArtCandidate) {
+      transitionalArtCandidate = ""
+      transitionalArtTimeout.stop()
+    }
+    queueSnapshotArt()
+  }
 
   function queueSnapshotArt() {
-    // Chromium advertises its own logo briefly during a track handoff. Wait
-    // for the new song metadata and give its real thumbnail a short moment
-    // to replace that transitional candidate before copying anything.
+    // Copy the tiny Chromium thumbnail as soon as metadata is present.
     if (!rawTitle && !rawArtist) return
+    // Chromium can keep advertising the old thumbnail across a new title.
+    // A genuinely new file can be copied quickly; a reused path needs time
+    // for Chromium to overwrite its contents before we take the snapshot.
+    localArtDelay.interval = lastSnapCandidate ? 650 : 200
     localArtDelay.restart()
   }
 
   Timer {
     id: localArtDelay
-    interval: 450
+    // The old Chromium cover often remains at the old MPRIS path briefly
+    // after new metadata arrives. Wait for its new thumbnail before copying.
+    interval: 200
     repeat: false
     onTriggered: root.snapshotArt()
   }
@@ -818,9 +1201,11 @@ Item {
     // An empty candidate is normal for a moment during a skip. Preserve the
     // previous decoded cover through that gap; a real new candidate clears
     // it immediately before its fast local snapshot starts.
-    if ((!rawTitle && !rawArtist) || artCandidate === "" || !controlPath || artProc.running) return
+    if ((!rawTitle && !rawArtist) || artCandidate === "" || !controlPath || artProc.running
+        || artCandidate === transitionalArtCandidate) return
     artUrl = ""
     artProc.__candidate = artCandidate
+    artProc.__trackKey = positionIdentity
     artProc.command = ["bash", controlPath, "art", artOwner, artCandidate]
     artProc.running = true
   }
@@ -835,17 +1220,23 @@ Item {
   Process {
     id: artProc
     property string __candidate: ""
+    property string __trackKey: ""
     stdout: StdioCollector {
       onStreamFinished: {
-        if (artProc.__candidate !== root.artCandidate) return
+        if (artProc.__candidate !== root.artCandidate || artProc.__trackKey !== root.positionIdentity) return
         var snapshot = String(text).trim()
-        if (snapshot.indexOf("/") === 0) root.artUrl = root.pathToFileUrl(snapshot)
+        if (snapshot.indexOf("/") === 0) {
+          root.lastSnapCandidate = artProc.__candidate
+          root.transitionalArtCandidate = ""
+          root.artUrl = root.pathToFileUrl(snapshot)
+        }
       }
     }
     // A track can change while a copy is in flight; that result is discarded
     // above, so start again against whatever is current now.
     onExited: {
-      if (artProc.__candidate !== root.artCandidate) Qt.callLater(root.snapshotArt)
+      if (artProc.__candidate !== root.artCandidate || artProc.__trackKey !== root.positionIdentity)
+        Qt.callLater(root.queueSnapshotArt)
     }
   }
 
@@ -862,7 +1253,27 @@ Item {
     var raw = activePlayer ? Number(activePlayer.length || 0) : 0
     if (isFinite(raw) && raw > 0 && raw < 86400) return raw
     var fallback = Number(catalogLength || 0)
-    return isFinite(fallback) && fallback > 0 && fallback < 86400 ? fallback : 0
+    if (isFinite(fallback) && fallback > 0 && fallback < 86400) return fallback
+    return !playing && !trackChanging && (displayedTitle || displayedArtist)
+      ? lastStableLength : 0
+  }
+
+  onLengthChanged: {
+    if (length > 0) lastStableLength = length
+    if (!activePlayer || (!rawTitle && !rawArtist)) return
+    if (length > 0 && positionAtIdentityValid && activePlayer.isPlaying) {
+      var reported = Number(activePlayer.position)
+      var elapsed = Math.max(0, (Date.now() - positionIdentityTimestamp) / 1000)
+      var nearEnd = reported >= length - Math.max(5, length * 0.02)
+      var expected = positionAtIdentity + elapsed
+      if (nearEnd && reported - expected > Math.max(5, elapsed + 2)) {
+        positionEndJump = true
+        lastStablePosition = Math.max(0, Math.min(expected, length))
+      }
+    }
+    // A duration arriving late is not itself a reason to delay the bar. Only
+    // wait again if the current position no longer fits the updated range.
+    if (!positionIsPlausible(activePlayer.position)) waitForStablePosition()
   }
 
   function runAction(action) {
@@ -890,8 +1301,15 @@ Item {
     var player = activePlayer
     var target = Number(seconds)
     if (!player || !player.canSeek || !isFinite(target)) return false
+    if (positionEndJump) {
+      positionEndJump = false
+      waitForStablePosition()
+    }
     var clamped = Math.max(0, length > 0 ? Math.min(target, length) : target)
     if (Math.abs(clamped - livePosition()) < 0.001) return false
+
+    seekCue = clamped >= livePosition() ? 1 : -1
+    seekCueSerial++
 
     // Apple Music's Chromium media session advertises relative seeking but
     // ignores the requested offset and applies its own ~30-second jump. Its
@@ -924,13 +1342,24 @@ Item {
 
   onActivePlayerChanged: {
     clearPendingSeek()
+    positionEndJump = false
+    lastObservedPosition = activePlayer ? Number(activePlayer.position || 0) : -1
+    if (length > 0) lastStableLength = length
+    if (activePlayer && displayedSource && displayedSource !== selectedSource)
+      clearDisplayedMetadata()
+    if (activePlayer) displayedSource = selectedSource
     refreshDisplayedMetadata()
+    queueSnapshotArt()
+  }
+
+  onSelectedSourceChanged: {
+    if (displayedSource && displayedSource !== selectedSource) clearDisplayedMetadata()
   }
 
   Connections {
     target: root.activePlayer
     function onPositionChanged() {
-      if (!root.positionReady) root.restartInitialPositionReveal()
+      root.observePositionChange()
       if (root.pendingSeekPosition < 0 || !root.activePlayer) return
       var expected = root.pendingSeekPosition
       if (root.activePlayer.isPlaying)
@@ -939,9 +1368,21 @@ Item {
       // Several wheel steps can be queued before Chromium replies. Ignore
       // acknowledgements for older intermediate steps and only hand control
       // back to MPRIS when it reaches the most recently requested position.
-      if (Math.abs(reported - expected) <= 3) root.clearPendingSeek()
+      if (Math.abs(reported - expected) <= 3) {
+        root.lastStablePosition = reported
+        root.clearPendingSeek()
+      }
     }
     function onIsPlayingChanged() {
+      if (!root.activePlayer) return
+      if (!root.activePlayer.isPlaying && !root.skipRequested
+          && (root.displayedTitle || root.displayedArtist)) {
+        root.positionEndJump = false
+        if (root.positionIsPlausible(root.lastStablePosition)) {
+          root.positionReady = true
+          initialPositionReveal.stop()
+        }
+      }
       if (root.pendingSeekPosition < 0) return
       root.pendingSeekPosition = root.livePosition()
       root.pendingSeekTimestamp = Date.now()
@@ -963,6 +1404,7 @@ Item {
         expected += (Date.now() - root.pendingSeekTimestamp) / 1000
       var reported = Number(root.activePlayer.position || 0)
       if (Math.abs(reported - expected) <= 3) {
+        root.lastStablePosition = reported
         root.clearPendingSeek()
         return
       }
@@ -978,13 +1420,18 @@ Item {
   }
 
   function livePosition() {
-    if (!activePlayer) return 0
+    var stable = isFinite(lastStablePosition) ? Math.max(0, lastStablePosition) : 0
+    if (!activePlayer || (!activePlayer.isPlaying && pendingSeekPosition < 0))
+      return length > 0 ? Math.min(stable, length) : stable
     // Quickshell's MPRIS wrapper already returns an interpolated live
     // position. Re-interpolating that value here caused the two clocks to
     // drift and made later seek calculations unreliable.
     var value = pendingSeekPosition >= 0
       ? pendingSeekPosition + (activePlayer.isPlaying ? (Date.now() - pendingSeekTimestamp) / 1000 : 0)
       : Number(activePlayer.position || 0)
+    if (!isFinite(value) || value < 0
+        || (pendingSeekPosition < 0 && !positionIsPlausible(value)))
+      return length > 0 ? Math.min(stable, length) : stable
     return length > 0 ? Math.max(0, Math.min(value, length)) : Math.max(0, value)
   }
 
@@ -1008,6 +1455,12 @@ Item {
       return JSON.stringify({
         windowOpen: root.windowKnownOpen,
         windowVisible: root.windowVisible,
+        youtubeAddress: root.youtubeAddress,
+        youtubeTargetAddress: root.youtubeTargetAddress,
+        youtubeVisible: root.youtubeVisible,
+        selectedSource: root.selectedSource,
+        lastPlayedSource: root.lastPlayedSource,
+        lastYoutubeAddress: root.lastYoutubeAddress,
         windowWorkspace: root.windowWorkspace,
         browserPid: root.browserPid,
         hasMedia: root.hasMedia,

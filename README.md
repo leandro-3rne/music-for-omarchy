@@ -1,7 +1,7 @@
-# Apple Music for Omarchy
+# Music for Omarchy
 
-Apple Music in the Omarchy bar, backed by a dedicated Chromium window and a
-native, theme-aware now-playing panel.
+A native, theme-aware MPRIS now-playing panel for music and browser media,
+with a dedicated Apple Music Chromium window.
 
 ![Apple Music now-playing panel](preview.png)
 
@@ -14,25 +14,31 @@ bar widget, and clean profile removal used here.
 
 This version keeps that foundation and expands it with:
 
-- A larger, keyboard-navigable native player panel.
+- A keyboard-navigable native player panel with a pixel-art turntable.
 - More robust track-change handling and progress reporting.
-- A two-stage cover pipeline: Chromium's local MPRIS image appears quickly,
-  then a higher-resolution match is queried from Apple's public iTunes Search
-  and Lookup APIs.
+- A small, pixelated cover on the record, sourced from MPRIS without waiting
+  for a high-resolution catalog download. Apple's catalog lookup can still
+  supply missing track durations.
 - Album, artist, title, duration, and collection-aware matching with guarded
   fallbacks and small in-memory caches.
 - Better coordination with Omarchy's bar popout navigation.
+- A window parked in `special:Music` takes priority. Otherwise currently
+  playing media wins; when both sources are idle or play at once, the last
+  source to actually start audio wins. Apple Music breaks ties. With multiple
+  YouTube windows, the last window to play audio is targeted for window actions.
 
 Thanks to Nick Pestov for the original implementation and its clear MIT
 licensing. See [Credits](#credits) and [LICENSE](LICENSE).
 
 ## Features
 
-- Left-click opens a native now-playing panel with artwork, metadata, progress,
+- Left-click opens a native now-playing panel with a pixel-art turntable, metadata, progress,
   and previous/play-pause/next controls.
 - The progress bar follows playback in real time and is interactive: click or
   drag anywhere on it to seek to a different position in the current track.
-- Right-click opens or hides the real `music.apple.com` Chromium window. If it
+- Right-click opens or hides the selected Apple Music or YouTube window; the
+  bottom button follows the same selection. Hiding YouTube parks only that
+  window, leaving the rest of the browser open. If the Apple Music window
   belongs to a Hyprland group, hiding detaches and moves only Apple Music while
   the other group members remain on their workspace. Opening it again joins
   the currently focused group, when there is one.
@@ -43,7 +49,7 @@ licensing. See [Credits](#credits) and [LICENSE](LICENSE).
   the target and joins the current group, when present.
 - Apple Music is single-instance. Opening it from a focused group on a fresh
   launch remembers that group and adds only the new Apple Music window to it;
-  an existing window in `special:Apple Music` is always brought to the current
+  an existing window in `special:Music` is always brought to the current
   workspace instead of exposing that parking workspace. When the scratchpad is
   visible (including the empty Scratchpad hint), it is the target workspace for
   the Apple Music window. If Apple Music is already on a normal workspace,

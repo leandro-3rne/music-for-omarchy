@@ -11,14 +11,17 @@ PLUGIN_ID="io.github.leandro-3rne.apple-music"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/leandro-3rne-apple-music"
 PROFILE_DIR="$DATA_DIR/chromium"
 STOREFRONT_FILE="$DATA_DIR/storefront"
+LAST_PLAYED_FILE="$DATA_DIR/last-played"
 # Keep enough of the original cover for the large, high-resolution player art.
 ART_MAX_BYTES=$((8 * 1024 * 1024))
-SPECIAL_WORKSPACE="special:Apple Music"
+SPECIAL_WORKSPACE="special:Music"
+PREVIOUS_SPECIAL_WORKSPACE="special:Apple Music"
 LEGACY_SPECIAL_WORKSPACE="special:AM"
 # Resolved once at startup, while the plugin folder is still known to be
 # there: quit_window checks this path later, after removal may have taken
 # the folder away.
 PLUGIN_DIR="$(dirname -- "${BASH_SOURCE[0]}")"
+WINDOW_SWITCHER_DIR="$HOME/.config/omarchy/plugins/io.github.leandro-3rne.window-switcher"
 
 # Apple Music can leave an authenticated web session in the 90-second preview
 # mode when the storefront inferred for the regionless URL does not match the
@@ -158,23 +161,46 @@ clear_stale_profile_locks() {
 # workspace is visible only while a monitor is presenting it; its name alone
 # is therefore not enough to decide whether the bar should say Open or Hide.
 state() {
-  local pid clients monitors
+  local pid clients monitors last_source="" last_address=""
   pid=$(browser_pid || true)
-  if [[ -z $pid ]]; then
-    jq -cn '{open:false,address:"",pid:0,workspace:"",visible:false}'
-    return
+  pid=${pid:-0}
+  if [[ -f $LAST_PLAYED_FILE && ! -L $LAST_PLAYED_FILE ]]; then
+    read -r last_source last_address <"$LAST_PLAYED_FILE" || true
   fi
-
+  [[ $last_source == apple || $last_source == youtube ]] || last_source=""
+  [[ $last_address =~ ^0x[0-9a-fA-F]+$ ]] || last_address=""
   clients=$(hyprctl -j clients 2>/dev/null) || clients="[]"
   monitors=$(hyprctl -j monitors 2>/dev/null) || monitors="[]"
-  jq -cn --argjson pid "$pid" --argjson clients "$clients" --argjson monitors "$monitors" '
+  jq -cn --argjson pid "$pid" --argjson clients "$clients" --argjson monitors "$monitors" \
+    --arg lastSource "$last_source" --arg lastAddress "$last_address" '
     (first($clients[] | select(.pid == $pid)) // null) as $c |
+    ([$clients[] | select((.title // "" | test("YouTube"; "i"))
+       or (.class // "" | test("youtube"; "i"))
+       or (.initialClass // "" | test("youtube"; "i")))]
+       | sort_by(if (.focusHistoryID // -1) < 0 then 999999 else .focusHistoryID end)) as $youtubeWindows |
+    ($youtubeWindows[0]) as $yt |
     ($c.workspace.name // "") as $workspace |
+    ($yt.workspace.name // "") as $youtubeWorkspace |
     {
       open: ($c != null),
       address: ($c.address // ""),
       pid: $pid,
+      lastPlayedSource: $lastSource,
+      lastYoutubeAddress: $lastAddress,
       workspace: $workspace,
+      appleHistory: (if $c == null then 999999 else ($c.focusHistoryID // 999999) end),
+      youtubeAddress: ($yt.address // ""),
+      youtubePid: ($yt.pid // 0),
+      youtubePids: [$youtubeWindows[] | .pid],
+      youtubeWindows: [$youtubeWindows[] | . as $yw | {
+        address, pid, title, workspace: .workspace.name,
+        visible: any($monitors[];
+          .activeWorkspace.name == $yw.workspace.name or .specialWorkspace.name == $yw.workspace.name)
+      }],
+      youtubeWorkspace: $youtubeWorkspace,
+      youtubeHistory: (if $yt == null then 999999 else ($yt.focusHistoryID // 999999) end),
+      youtubeVisible: ($yt != null and any($monitors[];
+        .activeWorkspace.name == $youtubeWorkspace or .specialWorkspace.name == $youtubeWorkspace)),
       visible: (
         $c != null and any($monitors[];
           .activeWorkspace.name == $workspace or .specialWorkspace.name == $workspace
@@ -182,6 +208,21 @@ state() {
       )
     }
   '
+}
+
+remember_playback() {
+  local source=${1:-} address=${2:-} youtube_address=${3:-} temp
+  [[ $source == apple || $source == youtube ]] || return 2
+  [[ $address =~ ^0x[0-9a-fA-F]+$ ]] || return 2
+  [[ $youtube_address =~ ^0x[0-9a-fA-F]+$ || -z $youtube_address ]] || return 2
+  if [[ $source == youtube ]]; then youtube_address=$address; fi
+  [[ ! -L $DATA_DIR && ! -L $LAST_PLAYED_FILE ]] || return 1
+  mkdir -p "$DATA_DIR"
+  chmod 700 "$DATA_DIR"
+  temp=$(mktemp "$DATA_DIR/.last-played.XXXXXX")
+  chmod 600 "$temp"
+  printf '%s %s\n' "$source" "$youtube_address" >"$temp"
+  mv -f -- "$temp" "$LAST_PLAYED_FILE"
 }
 
 launch() {
@@ -231,6 +272,7 @@ launch() {
 show_window() {
   local address=$1 target_address=${2:-} target_expr='hl.get_active_window()'
   local empty_scratchpad_state empty_scratchpad=false active_workspace_id scratchpad_visible=false
+  local source_window_json source_workspace_name source_workspace_id target_fullscreen_workspace_id
   [[ $address =~ ^0x[0-9a-fA-F]+$ ]] || { echo "invalid address: $address" >&2; exit 2; }
   if [[ -n $target_address ]]; then
     [[ $target_address =~ ^0x[0-9a-fA-F]+$ ]] || { echo "invalid target address: $target_address" >&2; exit 2; }
@@ -247,12 +289,29 @@ show_window() {
   if hyprctl -j monitors 2>/dev/null | jq -e 'any(.[]; .specialWorkspace.name == "special:scratchpad")' >/dev/null 2>&1; then
     scratchpad_visible=true
   fi
+  source_window_json=$(hyprctl -j clients 2>/dev/null | jq -c --arg address "$address" '
+    first(.[] | select(.address == $address)) // {}
+  ' 2>/dev/null || printf '{}')
+  source_workspace_name=$(jq -r '.workspace.name // ""' <<<"$source_window_json")
+  source_workspace_id=$(jq -r '.workspace.id // empty' <<<"$source_window_json")
+  if [[ $source_workspace_name == "$SPECIAL_WORKSPACE" || $source_workspace_name == "$PREVIOUS_SPECIAL_WORKSPACE" || $source_workspace_name == "$LEGACY_SPECIAL_WORKSPACE" ]]; then
+    if [[ $empty_scratchpad != true && $scratchpad_visible != true ]]; then
+      target_fullscreen_workspace_id=$active_workspace_id
+    else
+      target_fullscreen_workspace_id=""
+    fi
+  else
+    target_fullscreen_workspace_id=$source_workspace_id
+  fi
+  if [[ $target_fullscreen_workspace_id =~ ^[1-9][0-9]*$ ]]; then
+    bash "$WINDOW_SWITCHER_DIR/unfullscreen-workspace.sh" "$target_fullscreen_workspace_id" || true
+  fi
   # A workspace move is group-aware. Detach Apple Music first only when it is
   # parked on the Apple Music special workspace; focusing an already-placed
   # normal-workspace window must preserve its existing group.
   hyprctl eval "
     local w = hl.get_window(\"address:$address\")
-    if w and w.group and w.workspace and (w.workspace.name == \"$SPECIAL_WORKSPACE\" or w.workspace.name == \"$LEGACY_SPECIAL_WORKSPACE\") then
+    if w and w.group and w.workspace and (w.workspace.name == \"$SPECIAL_WORKSPACE\" or w.workspace.name == \"$PREVIOUS_SPECIAL_WORKSPACE\" or w.workspace.name == \"$LEGACY_SPECIAL_WORKSPACE\") then
       hl.dispatch(hl.dsp.window.move({ window = w, out_of_group = true }))
     end
   "
@@ -262,7 +321,7 @@ show_window() {
     local cursor = hl.get_cursor_pos()
     local source_ws = w.workspace
     local source_name = source_ws and source_ws.name or \"\"
-    local parked = source_name == \"$SPECIAL_WORKSPACE\" or source_name == \"$LEGACY_SPECIAL_WORKSPACE\"
+    local parked = source_name == \"$SPECIAL_WORKSPACE\" or source_name == \"$PREVIOUS_SPECIAL_WORKSPACE\" or source_name == \"$LEGACY_SPECIAL_WORKSPACE\"
 
     if not parked then
       -- The window is already in a user workspace (including a scratchpad).
@@ -288,7 +347,7 @@ show_window() {
         -- The Apple Music parking workspaces are never valid destinations.
         -- Keep the target empty if Hyprland cannot report a normal workspace;
         -- focusing the hidden window must not expose its parking special.
-        if target_name == \"$SPECIAL_WORKSPACE\" or target_name == \"$LEGACY_SPECIAL_WORKSPACE\" or target_name == \"\" then
+        if target_name == \"$SPECIAL_WORKSPACE\" or target_name == \"$PREVIOUS_SPECIAL_WORKSPACE\" or target_name == \"$LEGACY_SPECIAL_WORKSPACE\" or target_name == \"\" then
           target_name = nil
         end
         if target_group and target.workspace and target_name and target.workspace.name ~= target_name then
@@ -326,7 +385,7 @@ show_window() {
 # position too, defensively matching show_window, in case moving a window
 # across workspaces has the same pointer-warping side effect.
 hide_window() {
-  local address=$1 source_workspace source_was_scratchpad=false remaining_scratchpad
+  local address=$1 source_workspace source_was_scratchpad=false remaining_scratchpad was_fullscreen
   [[ $address =~ ^0x[0-9a-fA-F]+$ ]] || { echo "invalid address: $address" >&2; exit 2; }
   # Remember whether this exact window was the visible Scratchpad window. If
   # it is the last one there, close the now-empty special workspace just like
@@ -334,6 +393,10 @@ hide_window() {
   source_workspace=$(hyprctl -j clients 2>/dev/null | jq -r --arg address "$address" '
     first(.[] | select(.address == $address)) | .workspace.name // empty
   ' 2>/dev/null || true)
+  was_fullscreen=$(hyprctl -j clients 2>/dev/null | jq -r --arg address "$address" '
+    first(.[] | select(.address == $address)) | (.fullscreen // 0) > 0
+  ' 2>/dev/null || printf 'false')
+  was_fullscreen=${was_fullscreen:-false}
   if [[ $source_workspace == "special:scratchpad" ]]; then
     if hyprctl -j monitors 2>/dev/null | jq -e 'any(.[]; .specialWorkspace.name == "special:scratchpad")' >/dev/null 2>&1; then
       source_was_scratchpad=true
@@ -344,6 +407,10 @@ hide_window() {
   # then resolve the window again for the workspace move.
   hyprctl eval "
     local w = hl.get_window(\"address:$address\")
+    if w and $was_fullscreen then
+      hl.dispatch(hl.dsp.window.fullscreen({ window = w, mode = \"fullscreen\" }))
+      hl.exec_scheduled_prop_refresh_immediately()
+    end
     if w and w.group then
       hl.dispatch(hl.dsp.window.move({ window = w, out_of_group = true }))
     end
@@ -389,7 +456,7 @@ hide_window() {
 # the same output, so it stays an accurate proxy for "is the user looking at
 # this window right now."
 toggle_window() {
-  local current addr workspace visible active_ws
+  local current addr workspace visible
   current=$(state)
   if [[ $(jq -r '.open' <<<"$current") != "true" ]]; then
     launch
@@ -400,7 +467,7 @@ toggle_window() {
   workspace=$(jq -r '.workspace' <<<"$current")
   visible=$(jq -r '.visible' <<<"$current")
 
-  if [[ $workspace == "$SPECIAL_WORKSPACE" || $workspace == "$LEGACY_SPECIAL_WORKSPACE" ]]; then
+  if [[ $workspace == "$SPECIAL_WORKSPACE" || $workspace == "$PREVIOUS_SPECIAL_WORKSPACE" || $workspace == "$LEGACY_SPECIAL_WORKSPACE" ]]; then
     show_window "$addr"
     return
   fi
@@ -414,12 +481,59 @@ toggle_window() {
     return
   fi
 
-  active_ws=$(hyprctl -j activeworkspace 2>/dev/null | jq -r '.name // empty')
-  if [[ -n $active_ws && $workspace == "$active_ws" ]]; then
+  # Visibility is global across outputs, not relative to the clicked bar.
+  if [[ $visible == true ]]; then
     hide_window "$addr"
   else
     show_window "$addr"
   fi
+}
+
+# Focusing the YouTube window must not move the entire browser into the
+# dedicated Apple Music parking workspace or affect other browser windows.
+focus_media_window() {
+  local address=$1
+  [[ $address =~ ^0x[0-9a-fA-F]+$ ]] || return 2
+  hyprctl eval "
+    local w = hl.get_window(\"address:$address\")
+    if w then
+      local cursor = hl.get_cursor_pos()
+      hl.dispatch(hl.dsp.focus({ window = w }))
+      if cursor and cursor.x and cursor.y then
+        hl.dispatch(hl.dsp.cursor.move({ x = math.floor(cursor.x), y = math.floor(cursor.y) }))
+      end
+    end
+  "
+}
+
+# Act only on the newest YouTube window, even if the bar was clicked from a
+# different monitor. Re-resolve its address at click time, not popup-open time.
+toggle_media_window() {
+  local current address workspace visible
+  current=$(state)
+  address=${1:-}
+  [[ $address =~ ^0x[0-9a-fA-F]+$ ]] || return 1
+  # Validate the caller-selected window against the fresh list; a stale
+  # address must never move some unrelated window into the music workspace.
+  workspace=$(jq -r --arg address "$address" '
+    first(.youtubeWindows[] | select(.address == $address)) | .workspace // ""
+  ' <<<"$current")
+  [[ -n $workspace ]] || return 1
+  visible=$(jq -r --arg address "$address" '
+    first(.youtubeWindows[] | select(.address == $address)) | .visible // false
+  ' <<<"$current")
+  if [[ $visible == true && $workspace != "$SPECIAL_WORKSPACE" ]]; then
+    hide_window "$address"
+  else
+    show_window "$address"
+  fi
+}
+
+show_media_window() {
+  local address=$1
+  [[ $address =~ ^0x[0-9a-fA-F]+$ ]] || return 1
+  state | jq -e --arg address "$address" 'any(.youtubeWindows[]; .address == $address)' >/dev/null || return 1
+  show_window "$address"
 }
 
 # Copies the cover art the browser is advertising into this plugin's own
@@ -698,12 +812,16 @@ quit_window() {
 
 case ${1:-} in
 state) state ;;
+remember) remember_playback "${2:-}" "${3:-}" "${4:-}" ;;
 launch) launch ;;
 show)
   (( $# == 2 || $# == 3 )) || { echo "usage: $0 show <address> [group-target-address]" >&2; exit 2; }
   show_window "$2" "${3:-}"
   ;;
 toggle) toggle_window ;;
+focus-media) focus_media_window "${2:-}" ;;
+toggle-media) toggle_media_window "${2:-}" ;;
+show-media) show_media_window "${2:-}" ;;
 close) close_window ;;
 quit) quit_window ;;
 art)
@@ -715,7 +833,7 @@ storefront)
   set_storefront "$2"
   ;;
 *)
-  echo "usage: $0 <state|launch|show|toggle|close|quit|art|storefront>" >&2
+  echo "usage: $0 <state|launch|show|toggle|toggle-media|focus-media|close|quit|art|storefront>" >&2
   exit 2
   ;;
 esac

@@ -1,5 +1,7 @@
 import QtQuick
+import Qt5Compat.GraphicalEffects
 import Quickshell
+import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
 
@@ -26,15 +28,258 @@ BarWidget {
         // A cloned bar creates one widget per monitor. Only the popup the user
         // actually opened needs its own catalog request; hidden copies keep
         // the quick local thumbnail without multiplying network traffic.
-        catalogLookupEnabled: root.popoverOpen
+        catalogLookupEnabled: root.popoverOpen && activePlayer === applePlayer
       }
     }
   }
 
-  readonly property bool hasMedia: service ? service.hasMedia : false
+  // A MPRIS player can disappear for a single update during a skip. Keep
+  // the panel's size and last metadata stable independently of the service's
+  // player handoff; otherwise KeyboardPanel visibly collapses and expands.
+  property bool mediaVisibleHold: false
+  property string lastVisibleTitle: ""
+  property string lastVisibleArtist: ""
+  property string lastVisibleAlbum: ""
+  property bool coverPending: false
+  property string pendingCoverKey: ""
+  property string coverBeforeWait: ""
+  property int progressTick: 0
+  function syncCatalogLookup() {
+    if (!root.hostService || root.service !== root.hostService) return
+    var shouldLookup = !!(root.service.activePlayer && root.service.applePlayer
+      && root.service.activePlayer === root.service.applePlayer && root.service.hasMedia)
+    if (root.service.catalogLookupEnabled !== shouldLookup)
+      root.service.catalogLookupEnabled = shouldLookup
+  }
+  readonly property bool presentationWaiting: coverPending || !!(service &&
+    (service.trackChanging || (trackToken && trackToken !== displayedCoverKey)))
+  readonly property bool hasManagedApp: !!(service && (service.windowKnownOpen || service.youtubeTargetAddress))
+  readonly property bool hasMedia: hasManagedApp
+    && (!!(service && service.hasMedia) || (popoverOpen && mediaVisibleHold))
+  onHasMediaChanged: {
+    if (hasMedia) {
+      mediaVisibleHold = !!(service && service.hasMedia)
+      mediaHoldTimeout.stop()
+      Qt.callLater(function() { root.stageTrackPresentation() })
+    } else {
+      mediaVisibleHold = false
+      mediaHoldTimeout.stop()
+      if (coverPending) cancelTrackPresentation()
+    }
+  }
+  Connections {
+    target: root.service
+    function onAlbumChanged() {
+      if (root.hasMedia && !root.presentationWaiting && root.service && root.service.album)
+        root.lastVisibleAlbum = root.service.album
+    }
+    function onHasMediaChanged() {
+      if (!root.service) return
+      root.syncCatalogLookup()
+      if (root.service.hasMedia) {
+        root.mediaVisibleHold = true
+        mediaHoldTimeout.stop()
+      } else if (root.popoverOpen && root.mediaVisibleHold) {
+        mediaHoldTimeout.restart()
+        if (root.coverPending) root.cancelTrackPresentation()
+        else {
+          root.pendingCoverKey = ""
+          coverWaitTimeout.stop()
+        }
+      }
+    }
+    function onTrackChangingChanged() {
+      if (!root.service) return
+      if (root.service.trackChanging) root.beginTrackPresentation()
+      else Qt.callLater(function() {
+        if (root.service && !root.service.trackChanging && !root.service.skipRequested
+            && !root.service.playing && !root.pendingCoverKey)
+          root.cancelTrackPresentation()
+      })
+    }
+    function onCoverUrlChanged() {
+      if (root.coverPending) coverWaitTimeout.restart()
+      if (root.trackToken && coverCandidate.status === Image.Ready
+          && root.service && String(coverCandidate.source) === String(root.service.coverUrl)
+          && !coverSettle.running) coverSettle.restart()
+    }
+    function onArtLoadingChanged() {
+      if (root.coverPending) coverWaitTimeout.restart()
+    }
+    function onActivePlayerChanged() { root.syncCatalogLookup() }
+    function onArtworkLookupKeyChanged() { root.syncCatalogLookup() }
+  }
+  Timer {
+    id: mediaHoldTimeout
+    interval: 4000
+    onTriggered: if (!root.service || !root.service.hasMedia) root.mediaVisibleHold = false
+  }
+  Timer {
+    // Keep each monitor's progress bindings current independently of whether
+    // its dropdown content is currently mounted/open.
+    interval: 500
+    repeat: true
+    running: root.hasMedia
+    onTriggered: root.progressTick++
+  }
   readonly property bool playing: service ? service.playing : false
-  readonly property string title: service ? service.title : ""
-  readonly property string artist: service ? service.artist : ""
+  readonly property bool spinActive: playing && hasMedia && !presentationWaiting
+  function startRecordSpin() {
+    if (!popoverOpen || !spinActive || recordSpin.running) return
+    record.rotation = record.rotation % 360
+    recordSpin.from = record.rotation
+    recordSpin.to = record.rotation + 360
+    recordSpin.start()
+  }
+  onSpinActiveChanged: { if (spinActive) startRecordSpin(); else recordSpin.stop() }
+  readonly property string title: presentationWaiting
+    ? " "
+    : (root.hasMedia && service && service.hasMedia && service.title
+        ? service.title : (mediaVisibleHold ? lastVisibleTitle : ""))
+  readonly property string artist: presentationWaiting
+    ? ""
+    : (root.hasMedia && service && service.hasMedia && service.artist
+        ? service.artist : (mediaVisibleHold ? lastVisibleArtist : ""))
+  readonly property string album: presentationWaiting
+    ? ""
+    : (root.hasMedia && service && service.hasMedia && service.album
+        ? service.album : (mediaVisibleHold ? lastVisibleAlbum : ""))
+  onTitleChanged: if (root.hasMedia && !presentationWaiting && service && service.hasMedia && service.title) lastVisibleTitle = service.title
+  onArtistChanged: if (root.hasMedia && !presentationWaiting && service && service.hasMedia && service.artist) lastVisibleArtist = service.artist
+  readonly property string trackToken: root.hasMedia && service && !service.trackChanging && (service.title || service.artist)
+    ? String(service.selectedSource || "") + "\n" + service.title + "\n" + service.artist + "\n" + service.album : ""
+  property string displayedCover: ""
+  property string displayedCoverKey: ""
+
+  function beginTrackPresentation() {
+    if (!coverPending) coverBeforeWait = displayedCover
+    coverPending = true
+    pendingCoverKey = ""
+    displayedCover = ""
+    coverWaitTimeout.attempts = 0
+    coverWaitTimeout.stop()
+    coverSettle.stop()
+    recordSpin.stop()
+    recordSwap.stop()
+    record.scale = 1
+  }
+
+  function stageTrackPresentation() {
+    var key = root.trackToken
+    if (!root.service || !key) return
+    if (root.coverPending && !root.pendingCoverKey && key === root.displayedCoverKey
+        && !root.service.playing && !root.service.skipRequested) {
+      cancelTrackPresentation()
+      return
+    }
+    if (key === root.displayedCoverKey && !root.coverPending) return
+    if (!root.coverPending || root.pendingCoverKey !== key) {
+      if (!root.coverPending) root.coverBeforeWait = root.displayedCover
+      root.coverPending = true
+      root.pendingCoverKey = key
+      root.displayedCover = ""
+      coverWaitTimeout.attempts = 0
+      coverSettle.stop()
+    }
+    coverWaitTimeout.restart()
+    if (coverCandidate.status === Image.Ready && root.service.coverUrl
+        && String(coverCandidate.source) === String(root.service.coverUrl)
+        && !coverSettle.running) coverSettle.restart()
+  }
+
+  function finishTrackPresentation(key, coverSource) {
+    if (!root.service || !key || root.trackToken !== key || root.service.trackChanging) return false
+    if (root.coverPending && root.pendingCoverKey !== key) return false
+    if (!root.coverPending && root.displayedCoverKey !== key) return false
+
+    var nextCover = String(coverSource || "")
+    if (nextCover && (coverCandidate.status !== Image.Ready
+        || nextCover !== String(root.service.coverUrl)
+        || nextCover !== String(coverCandidate.source))) return false
+
+    var hadPresentedTrack = root.displayedCoverKey !== ""
+    var changedTrack = hadPresentedTrack && root.displayedCoverKey !== key
+    var changedImage = root.displayedCover !== nextCover
+    root.displayedCover = nextCover
+    root.displayedCoverKey = key
+    root.coverBeforeWait = ""
+    root.lastVisibleTitle = root.service.title
+    root.lastVisibleArtist = root.service.artist
+    root.lastVisibleAlbum = root.service.album
+    root.coverPending = false
+    root.pendingCoverKey = ""
+    coverWaitTimeout.stop()
+    if (nextCover && root.popoverOpen && (changedTrack || (hadPresentedTrack && changedImage)))
+      recordSwap.restart()
+    return true
+  }
+
+  function cancelTrackPresentation() {
+    coverSettle.stop()
+    coverWaitTimeout.stop()
+    displayedCover = coverBeforeWait
+    coverBeforeWait = ""
+    coverPending = false
+    pendingCoverKey = ""
+  }
+
+  onTrackTokenChanged: if (trackToken) stageTrackPresentation()
+  Timer {
+    id: coverSettle
+    interval: 300
+    onTriggered: {
+      if (!root.trackToken || !root.service || root.service.trackChanging
+          || coverCandidate.status !== Image.Ready || !root.service.coverUrl
+          || String(coverCandidate.source) !== String(root.service.coverUrl)) return
+      root.finishTrackPresentation(root.trackToken, String(coverCandidate.source))
+    }
+  }
+  Timer {
+    id: coverWaitTimeout
+    interval: 500
+    repeat: true
+    property int attempts: 0
+    onTriggered: {
+      if (!root.service || !root.coverPending || !root.pendingCoverKey
+          || root.pendingCoverKey !== root.trackToken || root.service.trackChanging) {
+        stop()
+        return
+      }
+      var candidateReady = coverCandidate.status === Image.Ready && root.service.coverUrl
+        && String(coverCandidate.source) === String(root.service.coverUrl)
+      if (candidateReady && !coverSettle.running) coverSettle.restart()
+      attempts++
+      var noArtwork = !root.service.coverUrl && !root.service.artLoading
+      var failedImage = coverCandidate.status === Image.Error && !root.service.artLoading
+      if (noArtwork || failedImage || attempts >= 20) {
+        root.finishTrackPresentation(root.pendingCoverKey, candidateReady ? String(coverCandidate.source) : "")
+        stop()
+      }
+    }
+  }
+  Image {
+    id: coverCandidate
+    visible: false
+    asynchronous: true
+    cache: !String(source).startsWith("file:")
+    sourceSize.width: 48
+    sourceSize.height: 48
+    source: root.service ? root.service.coverUrl : ""
+    onStatusChanged: if (status === Image.Ready && root.trackToken && !coverSettle.running) coverSettle.restart()
+  }
+  onServiceChanged: {
+    coverSettle.stop()
+    displayedCover = ""
+    displayedCoverKey = ""
+    coverBeforeWait = ""
+    coverPending = !!(service && (service.title || service.trackChanging))
+    pendingCoverKey = ""
+    coverWaitTimeout.stop()
+    Qt.callLater(function() { root.syncCatalogLookup() })
+    if (service && service.album) lastVisibleAlbum = service.album
+    Qt.callLater(function() { root.stageTrackPresentation() })
+  }
+  Component.onCompleted: Qt.callLater(function() { root.stageTrackPresentation() })
 
   property bool popoverOpen: false
   // The bar's panel navigation contract uses `opened` to identify widgets
@@ -92,6 +337,7 @@ BarWidget {
   function syncPopout() {
     if (!bar) return
     if (popoverOpen) {
+      if (trackToken && coverCandidate.status === Image.Ready) coverSettle.restart()
       if (bar.activePopout !== root) bar.requestPopout(root)
     } else if (bar.activePopout === root) {
       bar.releasePopout(root)
@@ -137,7 +383,8 @@ BarWidget {
   function activateCursor() {
     if (!root.cursorActive) return
     if (!root.service) return
-    if (root.cursorIndex === 1 && prevButton.enabled) root.service.runAction("previous")
+    if (root.cursorIndex === 0 && playButton.enabled) root.service.runAction("playPause")
+    else if (root.cursorIndex === 1 && prevButton.enabled) root.service.runAction("previous")
     else if (root.cursorIndex === 2 && playButton.enabled) root.service.runAction("playPause")
     else if (root.cursorIndex === 3 && nextButton.enabled) root.service.runAction("next")
     else if (root.cursorIndex === 4) root.openWindow()
@@ -145,6 +392,19 @@ BarWidget {
 
   onPopoverOpenChanged: {
     syncPopout()
+    syncCatalogLookup()
+    if (popoverOpen) {
+      // Refresh Date.now()-based progress before the popup paints, so closing
+      // the panel never leaves a stale position visible on the next open.
+      root.progressTick++
+      mediaVisibleHold = !!(service && service.hasMedia)
+      mediaHoldTimeout.stop()
+    } else {
+      mediaVisibleHold = false
+      mediaHoldTimeout.stop()
+    }
+    if (popoverOpen) startRecordSpin()
+    else recordSpin.stop()
     if (popoverOpen) {
       root.cursorActive = false
       root.cursorIndex = -1
@@ -166,7 +426,7 @@ BarWidget {
   // artwork/title tap — that should reliably take you to the window, not
   // occasionally hide it because it happened to already be in view.
   function focusWindowOnly() {
-    if (service) service.focusWindow()
+    if (service) service.focusPlayingWindow()
     close()
   }
 
@@ -268,7 +528,7 @@ BarWidget {
     owner: root
     open: root.popoverOpen
     focusTarget: keyCatcher
-    contentWidth: popup.fittedContentWidth(Style.space(340))
+    contentWidth: popup.fittedContentWidth(Style.space(380))
     contentHeight: popup.fittedContentHeight(column.implicitHeight)
 
     MusicKeyCatcher {
@@ -286,14 +546,7 @@ BarWidget {
         id: column
         anchors.fill: parent
 
-        Timer {
-          // Drives the interpolated progress display while the popover is open.
-          interval: 500
-          repeat: true
-          running: root.popoverOpen && root.hasMedia
-          onTriggered: progress.tick++
-        }
-        spacing: Style.space(12)
+        spacing: root.hasMedia ? Style.space(12) : popup.padding + Border.bottom(popup.borderSpec)
 
         // ---------- Now playing ----------
         // Wrapped in a plain Item (not a positioner) so the tap-to-open
@@ -301,7 +554,7 @@ BarWidget {
         // anchoring a sibling directly inside the Row itself would conflict
         // with Row's own child-positioning logic.
         Item {
-          visible: root.hasMedia
+          visible: true
           width: parent.width
           height: nowPlayingColumn.implicitHeight
 
@@ -309,73 +562,193 @@ BarWidget {
             id: nowPlayingColumn
             anchors.left: parent.left
             anchors.right: parent.right
-            spacing: Style.space(10)
+            spacing: root.hasMedia ? Style.space(10) : 0
 
-          BorderSurface {
+          Item {
             width: parent.width
-            height: width
-            radius: Style.spacing.labelGap
-            color: Style.normalFillFor(root.bar.foreground, Color.accent)
-            borderSpec: Border.controlSpec("normal", root.bar.foreground, Color.accent)
+          height: turntable.height + (root.hasMedia ? Style.space(8) : 0)
 
-            Image {
-              id: localArtImage
-              anchors.fill: parent
-              // Leave a slightly wider reveal of the framed surface around
-              // the artwork, keeping the border crisp without making it
-              // visually heavy.
-              anchors.margins: Style.space(5)
-              fillMode: Image.PreserveAspectCrop
-              asynchronous: true
-              // Chromium's small local thumbnail gives us the fast first
-              // paint while the larger catalog version downloads.
-              sourceSize.width: 768
-              sourceSize.height: 768
-              // Keep the decoded cover while the popup is closed. The source
-              // only changes with the track, so Qt can show the same artwork
-              // immediately on reopen instead of briefly exposing the dark
-              // placeholder while it decodes/downloads the 1024 px image.
-              cache: true
-              source: root.service ? (root.service.artUrl || "") : ""
-              // Shown only once there is a decoded image to show, so a file
-              // that turns out not to be one leaves the glyph below in place
-              // rather than an empty frame.
-              visible: source !== "" && status === Image.Ready
-                && root.service && !root.service.trackChanging
-            }
-
-            Image {
-              id: catalogArtImage
-              anchors.fill: parent
-              anchors.margins: Style.space(5)
-              fillMode: Image.PreserveAspectCrop
-              asynchronous: true
-              sourceSize.width: 1024
-              sourceSize.height: 1024
-              cache: true
-              source: root.service ? (root.service.highResArtUrl || "") : ""
-              // This layer replaces the quick local thumbnail only after it
-              // has decoded successfully, so downloading never causes a
-              // blank flash.
-              visible: source !== "" && status === Image.Ready
-                && root.service && !root.service.trackChanging
-            }
-
-            Text {
+            Rectangle {
+              id: turntable
+              width: parent.width
+              height: Math.round(width * 0.61)
               anchors.centerIn: parent
-              width: parent.width - Style.space(28)
-              visible: !localArtImage.visible && !catalogArtImage.visible
-              text: root.service && root.service.artLoading
-                ? "Song loading...✌️🥀"
-                : "Too broke for a cover image✌️🥀"
-              textFormat: Text.PlainText
-              color: root.bar.foreground
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.body
-              font.bold: true
-              horizontalAlignment: Text.AlignHCenter
-              verticalAlignment: Text.AlignVCenter
-              wrapMode: Text.Wrap
+              radius: Style.space(5)
+              color: Style.normalFillFor(root.bar.foreground, Color.accent)
+              border.width: 1
+              border.color: Color.accent
+
+              Rectangle {
+                x: Style.space(12)
+                y: Style.space(10)
+                width: turntable.height - Style.space(20)
+                height: width
+                color: "#34343c"
+                radius: Style.space(4)
+                border.width: Style.space(2)
+                border.color: "#595963"
+              }
+
+            Item {
+              id: record
+              width: turntable.height - Style.space(34)
+              height: width
+              x: Style.space(19)
+              y: Style.space(17)
+              transform: Rotation {
+                id: seekRotation
+                origin.x: record.width / 2
+                origin.y: record.height / 2
+              }
+              Connections {
+                target: root.service
+                function onSeekCueSerialChanged() {
+                  seekKick.stop()
+                  seekKick.from = seekRotation.angle
+                  // When paused, symmetric rotation; when playing, backward stronger to counter platter spin.
+                  var isPlaying = root.service && root.service.playing
+                  var forwardAngle = isPlaying ? 42 : 60
+                  var backwardAngle = isPlaying ? -80 : -60
+                  seekKick.to = seekRotation.angle + (root.service.seekCue > 0 ? forwardAngle : backwardAngle)
+                  seekKick.start()
+                }
+              }
+              NumberAnimation { id: seekKick; target: seekRotation; property: "angle"; duration: 200; easing.type: Easing.OutQuad }
+              SequentialAnimation {
+                id: recordSwap
+                NumberAnimation { target: record; property: "scale"; from: 0.78; to: 1.04; duration: 220; easing.type: Easing.OutCubic }
+                NumberAnimation { target: record; property: "scale"; to: 1; duration: 120; easing.type: Easing.OutQuad }
+              }
+              NumberAnimation {
+                id: recordSpin
+                target: record
+                property: "rotation"
+                duration: 2800
+                onFinished: root.startRecordSpin()
+              }
+              Canvas {
+                anchors.fill: parent
+                onPaint: {
+                  var ctx = getContext("2d")
+                  var pixel = 4
+                  ctx.clearRect(0, 0, width, height)
+                  for (var y = 0; y < height; y += pixel) {
+                    for (var x = 0; x < width; x += pixel) {
+                      var dx = x + pixel / 2 - width / 2
+                      var dy = y + pixel / 2 - height / 2
+                      var distance = Math.sqrt(dx * dx + dy * dy)
+                      if (distance > Math.min(width, height) / 2 - pixel) continue
+                      ctx.fillStyle = distance > width * 0.45 ? "#62626b"
+                        : Math.floor(distance / 7) % 2 ? "#292930" : "#17171b"
+                      ctx.fillRect(x, y, pixel, pixel)
+                    }
+                  }
+                }
+              }
+              Rectangle {
+                width: Math.round(record.width * 0.49)
+                height: width
+                anchors.centerIn: parent
+                radius: width / 2
+                color: Color.accent
+                border.width: Style.space(3)
+                border.color: "#777780"
+                visible: root.hasMedia && !root.presentationWaiting
+                Image {
+                  id: recordCover
+                  anchors.fill: parent
+                  anchors.margins: Style.space(3)
+                  fillMode: Image.PreserveAspectCrop
+                  asynchronous: true
+                  smooth: false
+                  sourceSize.width: 48
+                  sourceSize.height: 48
+                  cache: !String(source).startsWith("file:")
+                  source: root.displayedCover
+                  visible: false
+                }
+                Rectangle {
+                  id: coverMask
+                  anchors.fill: recordCover
+                  radius: width / 2
+                  color: "white"
+                  visible: false
+                }
+                OpacityMask {
+                  anchors.fill: recordCover
+                  source: recordCover
+                  maskSource: coverMask
+                  cached: true
+                  visible: root.displayedCover !== "" && recordCover.status === Image.Ready
+                }
+                Text {
+                  anchors.centerIn: parent
+                  text: "♫"
+                  color: Color.background
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.title
+                  visible: root.displayedCover === "" || recordCover.status !== Image.Ready
+                }
+              }
+              Rectangle {
+                anchors.centerIn: parent
+                width: Style.space(17)
+                height: width
+                color: "#a8a8b0"
+                border.width: 1
+                border.color: "#262630"
+                Rectangle {
+                  anchors.centerIn: parent
+                  width: Style.space(7)
+                  height: width
+                  color: "#17171b"
+                }
+              }
+            }
+              // Fixed pixel-art tonearm, stylus and control buttons: only
+              // the platter rotates, as it would on a real turntable.
+              Rectangle {
+                x: parent.width - Style.space(52)
+                y: Style.space(38)
+                width: Style.space(20)
+                height: width
+                color: "#62626b"
+                border.color: root.bar.foreground
+                border.width: 2
+              }
+              Rectangle {
+                x: parent.width - Style.space(184)
+                y: Style.space(66)
+                width: Style.space(145)
+                height: Style.space(7)
+                rotation: -13
+                color: "#c1c1c8"
+              }
+              Rectangle {
+                x: parent.width - Style.space(186)
+                y: Style.space(83)
+                width: Style.space(11)
+                height: Style.space(18)
+                color: Color.accent
+              }
+              Rectangle {
+                x: parent.width - Style.space(85)
+                y: parent.height - Style.space(44)
+                width: Style.space(26)
+                height: Style.space(22)
+                color: root.spinActive ? Color.accent : "#505059"
+                border.color: root.spinActive ? root.bar.foreground : "#777780"
+                border.width: 2
+              }
+              Rectangle {
+                x: parent.width - Style.space(49)
+                y: parent.height - Style.space(44)
+                width: Style.space(26)
+                height: Style.space(22)
+                color: !root.spinActive ? Color.accent : "#505059"
+                border.color: !root.spinActive ? root.bar.foreground : "#777780"
+                border.width: 2
+              }
             }
           }
 
@@ -383,6 +756,7 @@ BarWidget {
           // each is pinned to PlainText and rendered verbatim rather than
           // left to Text's default markup auto-detection.
           Column {
+            visible: root.hasMedia
             spacing: Style.space(4)
             width: parent.width
 
@@ -411,7 +785,7 @@ BarWidget {
             }
 
             Text {
-              text: root.service && root.service.album ? root.service.album : ""
+              text: root.album
               textFormat: Text.PlainText
               color: Qt.darker(root.bar.foreground, 1.6)
               font.family: root.bar.fontFamily
@@ -445,13 +819,40 @@ BarWidget {
           width: parent.width
           spacing: Style.space(4)
 
-          property int tick: 0
-          // Reading `tick` inside the binding is what makes the 500ms timer
-          // above actually invalidate `position` — livePosition() depends on
-          // Date.now(), which QML has no way to know changed on its own.
-          readonly property real position: { var _ = tick; return root.service ? root.service.livePosition() : 0 }
-          readonly property real length: root.service ? root.service.length : 0
-          readonly property bool lengthKnown: length > 0
+          // Reading progressTick makes the root's 500ms timer invalidate this
+          // binding — livePosition() depends on Date.now(), which QML cannot
+          // observe changing on its own.
+          readonly property real position: {
+            var _ = root.progressTick
+            return root.service && !root.presentationWaiting ? root.service.livePosition() : 0
+          }
+          readonly property real sourceLength: root.service ? root.service.length : 0
+          property real length: 0
+          property bool rangeSettling: false
+          readonly property bool lengthKnown: length > 0 && !rangeSettling
+
+          onSourceLengthChanged: {
+            rangeSettling = true
+            lengthSettle.interval = sourceLength > 0 && length <= 0 ? 1000 : 100
+            lengthSettle.restart()
+          }
+
+          Component.onCompleted: {
+            length = sourceLength
+            rangeSettling = false
+            lengthSettle.stop()
+          }
+
+          Timer {
+            id: lengthSettle
+            interval: 100
+            repeat: false
+            onTriggered: {
+              progress.length = progress.sourceLength
+              progress.rangeSettling = false
+              root.progressTick++
+            }
+          }
 
           function fmt(seconds) {
             var s = Math.max(0, Math.floor(seconds))
@@ -467,6 +868,36 @@ BarWidget {
             outline: true
             hasCursor: root.cursorActive && root.cursorIndex === 0
 
+            Rectangle {
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.leftMargin: Style.space(6)
+              anchors.rightMargin: Style.space(6)
+              height: Math.max(4, Math.round(Style.spacing.controlHeight * 0.11))
+              radius: height / 2
+              color: Style.selectedFillFor(root.bar.foreground, Color.accent)
+              visible: root.presentationWaiting || progress.rangeSettling || !progress.lengthKnown
+                || !root.service || !root.service.positionReady
+            }
+
+            Rectangle {
+              anchors.verticalCenter: parent.verticalCenter
+              width: playbackSlider.knobSize
+              height: width
+              radius: width / 2
+              color: root.bar.foreground
+              border.width: Math.max(1, Style.space(2))
+              border.color: root.bar.background
+              x: Style.space(6) + (!root.presentationWaiting && !progress.rangeSettling && progress.lengthKnown
+                && root.service && root.service.positionReady
+                ? Math.max(0, Math.min(1, progress.position / progress.length))
+                    * Math.max(0, parent.width - Style.space(12) - width)
+                : 0)
+              visible: root.presentationWaiting || progress.rangeSettling || !progress.lengthKnown
+                || !root.service || !root.service.positionReady
+            }
+
             MusicProgressSlider {
               id: playbackSlider
               bar: root.bar
@@ -476,13 +907,16 @@ BarWidget {
               minimum: 0
               maximum: Math.max(1, progress.length)
               step: 5
-              value: progress.position
-              enabled: progress.lengthKnown && root.service && root.service.activePlayer
+              value: progress.lengthKnown && !root.presentationWaiting
+                && root.service && root.service.positionReady ? progress.position : 0
+              enabled: !root.presentationWaiting && !progress.rangeSettling && progress.lengthKnown
+                && root.service && root.service.activePlayer
                 && root.service.activePlayer.canSeek
               // Keep the row's layout stable while Apple Music's catalogue
               // duration loads, but do not draw a placeholder slider whose
               // knob would visibly jump once the real range arrives.
-              opacity: progress.lengthKnown && root.service && root.service.positionReady
+              opacity: !root.presentationWaiting && !progress.rangeSettling && progress.lengthKnown
+                && root.service && root.service.positionReady
                 ? (enabled ? 1.0 : 0.45) : 0.0
               // Dragging only previews locally. One seek on release avoids
               // queueing dozens of asynchronous MPRIS requests and the large
@@ -500,6 +934,9 @@ BarWidget {
 
           Row {
             width: parent.width
+            // Keep the elapsed/total labels in step with the slider while
+            // MPRIS is settling a track change or late duration update.
+            opacity: !root.presentationWaiting && root.service ? 1.0 : 0.0
             Text {
               id: timeLeft
               text: progress.fmt(playbackSlider.dragging ? playbackSlider.liveValue : progress.position)
@@ -552,7 +989,8 @@ BarWidget {
                 root.cursorActive = true
                 root.cursorIndex = 1
               }
-              enabled: root.service && root.service.activePlayer && root.service.activePlayer.canGoPrevious
+              enabled: !root.presentationWaiting && root.service && root.service.activePlayer
+                && root.service.activePlayer.canGoPrevious
               opacity: enabled ? 1.0 : 0.4
               onClicked: if (root.service) root.service.runAction("previous")
             }
@@ -576,7 +1014,7 @@ BarWidget {
                 root.cursorActive = true
                 root.cursorIndex = 2
               }
-              enabled: root.service && root.service.activePlayer
+              enabled: !root.presentationWaiting && root.service && root.service.activePlayer
                 && (root.service.activePlayer.canTogglePlaying || root.service.activePlayer.canPlay || root.service.activePlayer.canPause)
               opacity: enabled ? 1.0 : 0.4
               onClicked: if (root.service) root.service.runAction("playPause")
@@ -601,7 +1039,8 @@ BarWidget {
                 root.cursorActive = true
                 root.cursorIndex = 3
               }
-              enabled: root.service && root.service.activePlayer && root.service.activePlayer.canGoNext
+              enabled: !root.presentationWaiting && root.service && root.service.activePlayer
+                && root.service.activePlayer.canGoNext
               opacity: enabled ? 1.0 : 0.4
               onClicked: if (root.service) root.service.runAction("next")
             }
@@ -610,7 +1049,7 @@ BarWidget {
 
         // ---------- Empty state ----------
         Column {
-          visible: !root.hasMedia
+          visible: false
           width: parent.width
           spacing: Style.space(8)
           topPadding: Style.space(10)
@@ -635,6 +1074,7 @@ BarWidget {
         }
 
         PanelSeparator {
+          visible: root.hasMedia
           foreground: root.bar.foreground
         }
 
@@ -646,7 +1086,9 @@ BarWidget {
           // windowKnownOpen alone can't distinguish hidden from shown.
           // Refreshed whenever the popover opens (see onPopoverOpenChanged),
           // so it's accurate at the moment it's seen.
-          text: root.service && root.service.windowVisible ? "Hide Apple Music" : "Open Apple Music"
+          text: root.service && root.service.selectedSource === "youtube"
+            ? (root.service.youtubeTargetVisible ? "Hide YouTube" : "Open YouTube")
+            : root.service && root.service.windowVisible ? "Hide Apple Music" : "Open Apple Music"
           bordered: true
           hasCursor: root.cursorActive && root.cursorIndex === 4
           onHovered: function(isHovered) {
@@ -659,6 +1101,47 @@ BarWidget {
           verticalPadding: Style.spacing.controlPaddingY
           onClicked: root.openWindow()
         }
+      }
+    }
+  }
+
+  // KeyboardPanel retains keyboard focus on the popup's original output.
+  // Its other-monitor dismiss surface doesn't focus that monitor merely on
+  // pointer entry, so a subsequent Super+F could fullscreen the old output.
+  Variants {
+    model: root.popoverOpen ? Quickshell.screens : []
+    delegate: Component {
+      PanelWindow {
+        required property var modelData
+        screen: modelData
+        visible: root.popoverOpen && popup.screen && modelData.name !== popup.screen.name
+        color: "transparent"
+        exclusionMode: ExclusionMode.Ignore
+        anchors { top: true; bottom: true; left: true; right: true }
+        WlrLayershell.namespace: "music-monitor-follow"
+        WlrLayershell.layer: WlrLayer.Overlay
+        WlrLayershell.keyboardFocus: WlrKeyboardFocus.OnDemand
+        property Item focusTarget: null
+        onFocusTargetChanged: if (focusTarget) Qt.callLater(function() { focusTarget.forceActiveFocus() })
+        MouseArea {
+          anchors.fill: parent
+          hoverEnabled: true
+          acceptedButtons: Qt.AllButtons
+          onEntered: {
+            var name = String(modelData.name || "")
+            if (!/^[A-Za-z0-9_.-]+$/.test(name)) return
+            Quickshell.execDetached(["hyprctl", "eval",
+              'hl.dispatch(hl.dsp.focus({ monitor = "' + name + '" }))'])
+          }
+          onClicked: root.close()
+        }
+        PanelKeyCatcher {
+          id: monitorCatcher
+          anchors.fill: parent
+          onCloseRequested: root.close()
+          onActivateRequested: if (root.service) root.service.runAction("playPause")
+        }
+        Component.onCompleted: focusTarget = monitorCatcher
       }
     }
   }
@@ -698,8 +1181,12 @@ BarWidget {
       if (event.key === Qt.Key_Left || event.text === "h") {
         catcher.moveRequested(-1, 0, event.isAutoRepeat); event.accepted = true; return
       }
-      if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter
-          || event.key === Qt.Key_Space) {
+      if (event.key === Qt.Key_Space) {
+        if (root.service) root.service.runAction("playPause")
+        event.accepted = true
+        return
+      }
+      if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
         catcher.activateRequested(); event.accepted = true
       }
     }
