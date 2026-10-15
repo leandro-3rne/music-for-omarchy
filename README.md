@@ -1,9 +1,12 @@
 # Music for Omarchy
 
-A native, theme-aware MPRIS now-playing panel for music and browser media,
-with a dedicated Apple Music Chromium window.
+A native, theme-aware MPRIS now-playing panel for Apple Music and YouTube,
+with a dedicated Apple Music Chromium window and controls for existing YouTube
+windows.
 
-![Apple Music now-playing panel](preview.png)
+| Apple Music | YouTube |
+| --- | --- |
+| ![Apple Music now-playing panel](preview.png) | ![YouTube now-playing panel](youtube.png) |
 
 ## About this version
 
@@ -59,6 +62,9 @@ licensing. See [Credits](#credits) and [LICENSE](LICENSE).
 - Scrolling the bar icon changes track.
 - The music-note icon becomes a small equalizer during playback.
 - The browser profile is separate from your normal Chromium profile.
+- YouTube windows are matched by their YouTube window title or app identity, so
+  unrelated browser pages that mention YouTube (such as this plugin's GitHub
+  page) are not mistaken for YouTube playback.
 
 ## Requirements
 

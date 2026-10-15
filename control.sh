@@ -174,7 +174,7 @@ state() {
   jq -cn --argjson pid "$pid" --argjson clients "$clients" --argjson monitors "$monitors" \
     --arg lastSource "$last_source" --arg lastAddress "$last_address" '
     (first($clients[] | select(.pid == $pid)) // null) as $c |
-    ([$clients[] | select((.title // "" | test("YouTube"; "i"))
+    ([$clients[] | select((.title // "" | test("YouTube$"; "i"))
        or (.class // "" | test("youtube"; "i"))
        or (.initialClass // "" | test("youtube"; "i")))]
        | sort_by(if (.focusHistoryID // -1) < 0 then 999999 else .focusHistoryID end)) as $youtubeWindows |
