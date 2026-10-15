@@ -559,6 +559,9 @@ import re
 import secrets
 import stat
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 
 ceiling = int(sys.argv[1])
 mode = sys.argv[2]
@@ -675,28 +678,61 @@ try:
             pass
         sys.exit(0)
 
-    src = sys.argv[4]
-    try:
-        src_fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
-        sys.exit(1)
-    try:
-        info = os.fstat(src_fd)
-        if not stat.S_ISREG(info.st_mode):
+    if mode == "snapshot-url":
+        url = sys.argv[4]
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
             sys.exit(1)
-        if info.st_size <= 0 or info.st_size > ceiling:
-            sys.exit(1)
-        chunks, total = [], 0
-        while total <= ceiling:
-            chunk = os.read(src_fd, 65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-    finally:
-        os.close(src_fd)
 
-    data = b"".join(chunks)
+        class HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, request, response, code, message, headers, new_url):
+                target = urllib.parse.urlsplit(new_url)
+                if target.scheme != "https" or not target.hostname or target.username or target.password:
+                    raise urllib.error.HTTPError(new_url, code, "non-HTTPS redirect refused", headers, response)
+                return super().redirect_request(request, response, code, message, headers, new_url)
+
+        opener = urllib.request.build_opener(HttpsOnlyRedirect)
+        request = urllib.request.Request(url, headers={"User-Agent": "music-for-omarchy artwork"})
+        try:
+            with opener.open(request, timeout=5) as response:
+                if urllib.parse.urlsplit(response.geturl()).scheme != "https":
+                    sys.exit(1)
+                content_length = response.headers.get("Content-Length")
+                if content_length and int(content_length) > ceiling:
+                    sys.exit(1)
+                chunks, total = [], 0
+                while total <= ceiling:
+                    chunk = response.read(min(65536, ceiling + 1 - total))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+        except (OSError, ValueError, urllib.error.URLError):
+            sys.exit(1)
+        data = b"".join(chunks)
+    else:
+        src = sys.argv[4]
+        try:
+            src_fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            sys.exit(1)
+        try:
+            info = os.fstat(src_fd)
+            if not stat.S_ISREG(info.st_mode):
+                sys.exit(1)
+            if info.st_size <= 0 or info.st_size > ceiling:
+                sys.exit(1)
+            chunks, total = [], 0
+            while total <= ceiling:
+                chunk = os.read(src_fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+        finally:
+            os.close(src_fd)
+        data = b"".join(chunks)
+
     if not data or len(data) > ceiling:
         sys.exit(1)
     if not (data.startswith(b"\x89PNG\r\n\x1a\n")
@@ -732,6 +768,13 @@ snapshot_art() {
   [[ $owner =~ ^[0-9a-f]{9,32}$ ]] || return 1
   [[ $src =~ ^/tmp/\.org\.chromium\.Chromium\.[A-Za-z0-9]+$ ]] || return 1
   art_helper snapshot "$owner" "$src"
+}
+
+snapshot_remote_art() {
+  local owner=$1 url=$2
+  [[ $owner =~ ^[0-9a-f]{9,32}$ ]] || return 1
+  [[ ${url,,} == https://* ]] || return 1
+  art_helper snapshot-url "$owner" "$url"
 }
 
 clear_art() {
@@ -828,12 +871,16 @@ art)
   (( $# == 3 )) || { echo "usage: $0 art <owner> <path>" >&2; exit 2; }
   snapshot_art "$2" "$3" || exit 1
   ;;
+art-url)
+  (( $# == 3 )) || { echo "usage: $0 art-url <owner> <https-url>" >&2; exit 2; }
+  snapshot_remote_art "$2" "$3" || exit 1
+  ;;
 storefront)
   (( $# == 2 )) || { echo "usage: $0 storefront <country-code>" >&2; exit 2; }
   set_storefront "$2"
   ;;
 *)
-  echo "usage: $0 <state|launch|show|toggle|toggle-media|focus-media|close|quit|art|storefront>" >&2
+  echo "usage: $0 <state|launch|show|toggle|toggle-media|focus-media|close|quit|art|art-url|storefront>" >&2
   exit 2
   ;;
 esac

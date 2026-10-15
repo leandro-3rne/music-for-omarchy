@@ -141,9 +141,11 @@ album as search terms to Apple's public iTunes Search/Lookup endpoints. Cover
 images are then fetched from Apple's artwork CDN. No Apple account credential,
 cookie, browser profile, or local file is sent by the plugin.
 
-The current MPRIS thumbnail is copied into a user-only runtime directory before
-QML loads it. The copy is replaced on track changes and disappears with the
-user session.
+MPRIS artwork is copied into a user-only runtime directory before QML loads it.
+Remote artwork is fetched only over HTTPS, with a 5-second connection/read
+timeout, a 16-second overall limit, and an 8 MiB response-size cap; redirects
+must remain on HTTPS. The copy is replaced on track changes and disappears with
+the user session.
 
 ## Remove
 

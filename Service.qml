@@ -1148,7 +1148,9 @@ Item {
     var url = activePlayer ? String(activePlayer.trackArtUrl || "") : ""
     return /^https:\/\//i.test(url) ? url : ""
   }
-  readonly property string coverUrl: directArtUrl || artUrl
+  // All artwork reaches QML through a bounded, private local snapshot. In
+  // particular, never hand an untrusted MPRIS HTTPS URL directly to Image.
+  readonly property string coverUrl: artUrl
 
   // What the popover actually loads: control.sh's own copy of the artwork,
   // never the name above. That name is one this plugin is handed rather than
@@ -1177,6 +1179,7 @@ Item {
     }
     queueSnapshotArt()
   }
+  onDirectArtUrlChanged: queueSnapshotArt()
 
   function queueSnapshotArt() {
     // Copy the tiny Chromium thumbnail as soon as metadata is present.
@@ -1201,12 +1204,16 @@ Item {
     // An empty candidate is normal for a moment during a skip. Preserve the
     // previous decoded cover through that gap; a real new candidate clears
     // it immediately before its fast local snapshot starts.
-    if ((!rawTitle && !rawArtist) || artCandidate === "" || !controlPath || artProc.running
-        || artCandidate === transitionalArtCandidate) return
+    var remoteUrl = artCandidate === "" ? directArtUrl : ""
+    if ((!rawTitle && !rawArtist) || (artCandidate === "" && remoteUrl === "")
+        || !controlPath || artProc.running || artCandidate === transitionalArtCandidate) return
     artUrl = ""
     artProc.__candidate = artCandidate
+    artProc.__remoteUrl = remoteUrl
     artProc.__trackKey = positionIdentity
-    artProc.command = ["bash", controlPath, "art", artOwner, artCandidate]
+    artProc.command = remoteUrl !== ""
+      ? ["timeout", "16s", "bash", controlPath, "art-url", artOwner, remoteUrl]
+      : ["bash", controlPath, "art", artOwner, artCandidate]
     artProc.running = true
   }
 
@@ -1220,10 +1227,13 @@ Item {
   Process {
     id: artProc
     property string __candidate: ""
+    property string __remoteUrl: ""
     property string __trackKey: ""
     stdout: StdioCollector {
       onStreamFinished: {
-        if (artProc.__candidate !== root.artCandidate || artProc.__trackKey !== root.positionIdentity) return
+        var currentRemoteUrl = root.artCandidate === "" ? root.directArtUrl : ""
+        if (artProc.__candidate !== root.artCandidate || artProc.__remoteUrl !== currentRemoteUrl
+            || artProc.__trackKey !== root.positionIdentity) return
         var snapshot = String(text).trim()
         if (snapshot.indexOf("/") === 0) {
           root.lastSnapCandidate = artProc.__candidate
@@ -1235,7 +1245,9 @@ Item {
     // A track can change while a copy is in flight; that result is discarded
     // above, so start again against whatever is current now.
     onExited: {
-      if (artProc.__candidate !== root.artCandidate || artProc.__trackKey !== root.positionIdentity)
+      var currentRemoteUrl = root.artCandidate === "" ? root.directArtUrl : ""
+      if (artProc.__candidate !== root.artCandidate || artProc.__remoteUrl !== currentRemoteUrl
+          || artProc.__trackKey !== root.positionIdentity)
         Qt.callLater(root.queueSnapshotArt)
     }
   }
