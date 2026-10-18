@@ -143,9 +143,12 @@ cookie, browser profile, or local file is sent by the plugin.
 
 MPRIS artwork is copied into a user-only runtime directory before QML loads it.
 Remote artwork is fetched only over HTTPS, with a 5-second connection/read
-timeout, a 16-second overall limit, and an 8 MiB response-size cap; redirects
-must remain on HTTPS. The copy is replaced on track changes and disappears with
-the user session.
+timeout, a 16-second overall limit, and an 8 MiB response-size cap. Redirect
+bodies are discarded without reading, and every redirect must remain on HTTPS.
+PNG ancillary metadata is removed and image dimensions are capped before QML
+decodes the snapshot, preventing oversized metadata or pixel buffers from
+reaching the shared shell. The copy is replaced on track changes and disappears
+with the user session.
 
 ## Remove
 

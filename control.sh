@@ -559,9 +559,11 @@ import re
 import secrets
 import stat
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 
 ceiling = int(sys.argv[1])
 mode = sys.argv[2]
@@ -604,6 +606,62 @@ def make_dir(name, parent_fd):
     except FileExistsError:
         pass
     return open_dir(name, parent_fd, repair=True)
+
+
+def sanitize_png(data):
+    """Drop ancillary PNG metadata before the shared shell can decode it."""
+    signature = b"\x89PNG\r\n\x1a\n"
+    if not data.startswith(signature):
+        return data
+
+    output = bytearray(signature)
+    offset = len(signature)
+    saw_ihdr = saw_idat = saw_iend = False
+    kept_chunks = {b"IHDR", b"PLTE", b"tRNS", b"IDAT", b"IEND"}
+
+    while offset + 12 <= len(data):
+        length = int.from_bytes(data[offset:offset + 4], "big")
+        end = offset + 12 + length
+        if end > len(data):
+            raise ValueError("truncated PNG chunk")
+        kind = data[offset + 4:offset + 8]
+        payload = data[offset + 8:offset + 8 + length]
+        crc = int.from_bytes(data[offset + 8 + length:end], "big")
+        if zlib.crc32(kind + payload) & 0xffffffff != crc:
+            raise ValueError("invalid PNG chunk checksum")
+
+        if not saw_ihdr:
+            if kind != b"IHDR" or length != 13:
+                raise ValueError("invalid PNG header")
+            width = int.from_bytes(payload[:4], "big")
+            height = int.from_bytes(payload[4:8], "big")
+            if (width < 1 or height < 1 or width > 4096 or height > 4096
+                    or width * height > 4_194_304):
+                raise ValueError("PNG dimensions exceed artwork limit")
+            saw_ihdr = True
+        elif kind == b"IHDR":
+            raise ValueError("duplicate PNG header")
+
+        # Unknown critical chunks can change how pixels are interpreted, so
+        # reject them. Ancillary chunks (including compressed text, EXIF,
+        # profiles, and animation metadata) are intentionally discarded.
+        if kind[0] & 0x20 == 0 and kind not in kept_chunks:
+            raise ValueError("unsupported critical PNG chunk")
+        if kind == b"IDAT":
+            saw_idat = True
+        if kind == b"IEND":
+            if length != 0 or not saw_idat or end != len(data):
+                raise ValueError("invalid PNG end")
+            saw_iend = True
+        if kind in kept_chunks:
+            output.extend(data[offset:end])
+        offset = end
+        if saw_iend:
+            break
+
+    if not (saw_ihdr and saw_idat and saw_iend):
+        raise ValueError("incomplete PNG")
+    return bytes(output)
 
 
 runtime = os.environ.get("XDG_RUNTIME_DIR", "")
@@ -684,24 +742,46 @@ try:
         if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
             sys.exit(1)
 
-        class HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, request, response, code, message, headers, new_url):
-                target = urllib.parse.urlsplit(new_url)
-                if target.scheme != "https" or not target.hostname or target.username or target.password:
-                    raise urllib.error.HTTPError(new_url, code, "non-HTTPS redirect refused", headers, response)
-                return super().redirect_request(request, response, code, message, headers, new_url)
+                return None
 
-        opener = urllib.request.build_opener(HttpsOnlyRedirect)
-        request = urllib.request.Request(url, headers={"User-Agent": "music-for-omarchy artwork"})
+        opener = urllib.request.build_opener(NoRedirect)
+        current_url = url
+        deadline = time.monotonic() + 16
         try:
-            with opener.open(request, timeout=5) as response:
-                if urllib.parse.urlsplit(response.geturl()).scheme != "https":
+            for redirect_count in range(11):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     sys.exit(1)
+                target = urllib.parse.urlsplit(current_url)
+                if target.scheme != "https" or not target.hostname or target.username or target.password:
+                    sys.exit(1)
+                request = urllib.request.Request(
+                    current_url, headers={"User-Agent": "music-for-omarchy artwork"})
+                try:
+                    response = opener.open(request, timeout=min(5, remaining))
+                except urllib.error.HTTPError as redirect:
+                    if redirect.code not in (301, 302, 303, 307, 308) or redirect_count >= 10:
+                        raise
+                    location = redirect.headers.get("Location") or redirect.headers.get("URI")
+                    redirect.close()  # Never read an untrusted redirect body.
+                    if not location:
+                        sys.exit(1)
+                    current_url = urllib.parse.urljoin(current_url, location)
+                    continue
+                break
+            else:
+                sys.exit(1)
+
+            with response:
                 content_length = response.headers.get("Content-Length")
                 if content_length and int(content_length) > ceiling:
                     sys.exit(1)
                 chunks, total = [], 0
                 while total <= ceiling:
+                    if time.monotonic() >= deadline:
+                        sys.exit(1)
                     chunk = response.read(min(65536, ceiling + 1 - total))
                     if not chunk:
                         break
@@ -740,6 +820,11 @@ try:
             or data[:6] in (b"GIF87a", b"GIF89a")
             or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")):
         sys.exit(1)
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        try:
+            data = sanitize_png(data)
+        except (ValueError, OverflowError):
+            sys.exit(1)
 
     name = PREFIX + owner + "." + secrets.token_hex(8)
     out_fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
